@@ -47,7 +47,7 @@ env:
   APP_ID: "explor"
   APP_NAME: "explor"
   APP_AUTHOR: "Julien Barnier"
-  APP_DESC: "Interactive exploration of multivariate analysis results (PCA, MCA, CA) - a Shiny interface for FactoMineR/ade4/MASS outputs"
+  APP_DESC: "Interactive exploration of multivariate analysis results (PCA, MCA, CA) - a Shiny interface for FactoMineR / ade4 / MASS outputs"
   APP_HOMEPAGE: "https://juba.github.io/explor/"
   APP_LICENSE: "GPL-3.0"
   APP_MODE: "auto"
@@ -61,13 +61,15 @@ env:
   DEMO_SAVE_AS: ""
   DEMO_RDATA: ""
   EXTRA_PKGS: "FactoMineR"
-  EXCLUDE: "rsconnect,.github"
+  EXCLUDE: ".github"
   ARCHIVE_URLS: ""
   EXTRA_REPOS: ""
   SOFT_PKGS: ""
   SOURCE_REBUILD: ""
-  APP_NOTES: "Opens with a demo PCA of FactoMineR::decathlon (12 quantitative variables). explor() dispatches on the analysis object; the desktop entry returns that app object."
+  APP_NOTES: "package-fn: opens a demo PCA of FactoMineR::decathlon (12 quantitative variables). explor() dispatches on the analysis object and returns the shiny app object."
   MAX_REQUEST_MB: "1024"
+  SMOKE: "on"
+  SMOKE_TIMEOUT_SEC: "300"
   R_VERSION: "4.6.1"
 
 jobs:
@@ -89,7 +91,7 @@ jobs:
 
       - name: Install build helpers
         shell: bash
-        run: Rscript -e 'install.packages(c("jsonlite","zip","digest","BiocManager"), repos="https://cloud.r-project.org")'
+        run: Rscript -e 'install.packages(c("jsonlite","zip","digest","BiocManager","callr","curl"), repos="https://cloud.r-project.org")'
 
       - name: Resolve store version
         shell: bash
@@ -145,8 +147,8 @@ jobs:
             txt <- paste(unlist(lapply(sf, function(f) tryCatch(readLines(f, warn = FALSE), error = function(e) character()))), collapse = "\n")
             grab <- function(pat) { x <- regmatches(txt, gregexpr(pat, txt))[[1]]; if (length(x)) gsub("[()\"']", "", sub(".*?(library|require)", "", x)) else character() }
             seed <- unique(c(grab("library\\([A-Za-z0-9._\"']+"), grab("require\\([A-Za-z0-9._\"']+"),
-                             sub("::.*$", "", regmatches(txt, gregexpr("([A-Za-z][A-Za-z0-9._]+)::", txt))[[1]])),
-                             split_pkgs(Sys.getenv("EXTRA_PKGS")), "shiny")
+                             sub("::.*$", "", regmatches(txt, gregexpr("([A-Za-z][A-Za-z0-9._]+)::", txt))[[1]]),
+                             split_pkgs(Sys.getenv("EXTRA_PKGS")), "shiny"))
           } else if (mode == "package-fn") {
             dcf <- read.dcf(file.path(pkgroot, "DESCRIPTION")); pkg_name <- unname(dcf[1, "Package"])
             writeLines(c(opt(), Sys.getenv("ENTRY_FN")), file.path(appdir, "app.R"))
@@ -175,6 +177,8 @@ jobs:
           er <- split_pkgs(Sys.getenv("EXTRA_REPOS"))
           repos <- unique(c(er, BiocManager::repositories())); options(repos = repos)
           db <- available.packages(repos = repos, type = "source")
+          dropped <- setdiff(seed, rownames(db)); if (length(dropped)) cat("WARN dropped (not in CRAN/Bioc):", paste(dropped, collapse = ", "), "\n")
+          seed <- intersect(seed, rownames(db))
           closure <- unique(c(seed, unlist(tools::package_dependencies(seed, db = db, recursive = TRUE))))
           closure <- setdiff(closure, base_pkgs); closure <- intersect(closure, rownames(db))
           cat("closure size:", length(closure), "\n")
@@ -185,6 +189,17 @@ jobs:
           ins <- function(p, type = "both", deps = NA) if (length(p)) install.packages(p, lib = lib, repos = repos, type = type, dependencies = deps, Ncpus = 2)
           ins(closure)
           nb <- setdiff(closure, have()); if (length(nb)) { cat("source retry:", length(nb), "\n"); ins(nb, type = "source", deps = FALSE) }
+          if (identical(unname(Sys.info()[["sysname"]]), "Darwin")) {
+            sr <- split_pkgs(Sys.getenv("SOURCE_REBUILD"))
+            if (length(sr)) {
+              oldpath <- Sys.getenv("PATH"); pth <- strsplit(oldpath, .Platform$path.sep)[[1]]
+              pth <- pth[!grepl("homebrew|linuxbrew", pth, ignore.case = TRUE)]
+              Sys.setenv(PATH = paste(pth, collapse = .Platform$path.sep), PKG_CONFIG_PATH = "", PKG_CONFIG_LIBDIR = "")
+              cat("macOS source rebuild (Homebrew hidden):", paste(sr, collapse = ", "), "\n")
+              ins(sr, type = "source", deps = FALSE)
+              Sys.setenv(PATH = oldpath)
+            }
+          }
           if (mode == "package-fn") { install.packages(pkgroot, lib = lib, repos = NULL, type = "source", dependencies = FALSE); if (!pkg_name %in% have()) stop("app package failed to install: ", pkg_name) }
           for (u in split_pkgs(Sys.getenv("ARCHIVE_URLS"))) { f <- tempfile(fileext = ".tar.gz"); download.file(u, f, mode = "wb", quiet = TRUE); try(install.packages(f, lib = lib, repos = NULL, type = "source", dependencies = FALSE), silent = TRUE) }
 
@@ -197,8 +212,6 @@ jobs:
           }
 
           if (identical(unname(Sys.info()[["sysname"]]), "Darwin")) {
-            sr <- split_pkgs(Sys.getenv("SOURCE_REBUILD"))
-            if (length(sr)) { cat("macOS source rebuild:", paste(sr, collapse = ", "), "\n"); ins(sr, type = "source", deps = FALSE) }
             bins <- list.files(lib, pattern = "[.](so|dylib)$", recursive = TRUE, full.names = TRUE); bad <- character()
             for (b in bins) { o <- suppressWarnings(system2("otool", c("-L", shQuote(b)), stdout = TRUE, stderr = FALSE)); if (any(grepl("(/opt/X11|/opt/homebrew|/usr/local/opt)", o))) bad <- c(bad, b) }
             if (length(bad)) stop("non-portable dylib references: ", paste(unique(basename(bad)), collapse = ", "))
@@ -235,6 +248,44 @@ jobs:
           if (sz > 2 * 1024^3) stop("bundle exceeds the 2 GiB GitHub Release asset limit; trim modules or use a smaller closure.")
           writeLines(sprintf('{"platform":"%s","file":"%s","sha256":"%s","size":%d}', "${{ matrix.platform }}", out, sha, sz),
                      sprintf("meta-%s.json", "${{ matrix.platform }}"))
+
+      - name: Smoke test (launch the bundle like the ShinyApps shell)
+        if: ${{ env.SMOKE != 'off' }}
+        timeout-minutes: 12
+        shell: Rscript {0}
+        run: |
+          # Reproduce the ShinyApps shell's startup: put the bundle's rlib on .libPaths and
+          # load the app from its own directory. Runs in a child process with a hard timeout so
+          # it can never hang, and surfaces the exact R error if the app fails to start.
+          app_id <- Sys.getenv("APP_ID"); ver <- Sys.getenv("VERSION"); plat <- "${{ matrix.platform }}"
+          zip <- sprintf("%s-%s-%s.zip", app_id, ver, plat)
+          if (!file.exists(zip)) stop("smoke: bundle not found: ", zip)
+          tmp <- tempfile("smoke"); dir.create(tmp)
+          utils::unzip(zip, exdir = tmp)
+          appdir <- file.path(tmp, "app"); lib <- file.path(tmp, "rlib")
+          if (!dir.exists(appdir) || !dir.exists(lib)) stop("smoke: unexpected bundle layout")
+          timeout <- suppressWarnings(as.integer(Sys.getenv("SMOKE_TIMEOUT_SEC", "300"))); if (is.na(timeout) || timeout < 30) timeout <- 300
+          cat(sprintf("smoke: loading app '%s' (rlib on .libPaths)\n", app_id))
+          load_app <- function(appdir, lib) {
+            .libPaths(c(lib, .libPaths()))
+            old <- setwd(appdir); on.exit(setwd(old), add = TRUE)
+            if (file.exists("app.R")) {
+              obj <- source("app.R")$value
+              if (!inherits(obj, "shiny.appobj")) stop("app.R did not return a shiny app object")
+            } else if (file.exists("ui.R") && file.exists("server.R")) {
+              if (file.exists("global.R")) source("global.R")
+              source("ui.R"); source("server.R")
+              obj <- shiny::shinyApp(ui, server)
+            } else stop("no app.R and no ui.R/server.R")
+            invisible(TRUE)
+          }
+          res <- tryCatch(callr::r(load_app, args = list(appdir = appdir, lib = lib), timeout = timeout, show = TRUE),
+                          error = function(e) e)
+          if (inherits(res, "error")) {
+            cat("\n---- smoke error ----\n"); cat(conditionMessage(res), "\n")
+            stop("smoke test FAILED: the app did not start: ", conditionMessage(res))
+          }
+          cat("SMOKE OK\n")
 
       - uses: actions/upload-artifact@v4
         with:
